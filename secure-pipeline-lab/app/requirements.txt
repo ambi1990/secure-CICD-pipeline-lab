@@ -1,0 +1,5 @@
+# Deliberately outdated versions with known CVEs, for SCA tools to find
+Flask==2.0.0
+Werkzeug==2.0.0
+PyYAML==5.3.1
+requests==2.25.0

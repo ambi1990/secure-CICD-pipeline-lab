@@ -1,0 +1,151 @@
+# Security pipeline for the lab.
+#
+# Stages:
+#   1. secrets-scan  - Gitleaks over full Git history
+#   2. sast          - Semgrep (registry rulesets + custom rules), results to GitHub Security tab
+#   3. sca           - pip-audit for vulnerable Python dependencies
+#   4. config-scan   - Checkov for Dockerfile + GitHub Actions misconfigurations
+#   5. build-scan-sign
+#        build image -> generate CycloneDX SBOM (Syft) -> Trivy image scan (gate)
+#        -> on main only: push to GHCR, sign with cosign (keyless), attest SBOM, verify
+#
+# Hardening applied to the pipeline itself:
+#   - default token is read-only; each job asks only for the permissions it needs
+#   - keyless signing via OIDC: no long-lived signing keys stored as secrets
+#   - TODO (good exercise): pin every third-party action to a full commit SHA
+#     instead of a tag, e.g. actions/checkout@<sha>  # v4
+
+name: security-pipeline
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secrets-scan:
+    name: Secrets scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # scan full history, not just the latest commit
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  sast:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # upload SARIF to the Security tab
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v4
+      - name: Semgrep scan
+        run: >
+          semgrep scan
+          --config p/python
+          --config p/flask
+          --config .semgrep/custom-rules.yml
+          --sarif --output semgrep.sarif
+          --error
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+
+  sca:
+    name: Dependency scan (pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pip-audit
+      - run: pip-audit -r app/requirements.txt --desc
+
+  config-scan:
+    name: Config scan (Checkov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install checkov
+      - run: checkov -d . --framework dockerfile github_actions --compact
+
+  build-scan-sign:
+    name: Build, SBOM, image scan, sign
+    runs-on: ubuntu-latest
+    # Phase 2 exercise: once the earlier findings are fixed, uncomment this so the
+    # image is only built when every other gate passes.
+    # needs: [secrets-scan, sast, sca, config-scan]
+    permissions:
+      contents: read
+      packages: write # push to GHCR
+      id-token: write # OIDC token for keyless cosign signing
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image name (GHCR needs lowercase)
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}" >> "$GITHUB_ENV"
+
+      - name: Build image
+        run: docker build -t "$IMAGE" .
+
+      - name: Generate SBOM (CycloneDX, via Syft)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json # also uploaded as a workflow artifact
+
+      - name: Scan image with Trivy (fail on fixable HIGH/CRITICAL)
+        # docker save + --input avoids mounting the Docker socket into the scanner
+        run: |
+          docker save "$IMAGE" -o image.tar
+          docker run --rm -v "$PWD:/work" aquasec/trivy:0.57.0 image \
+            --input /work/image.tar \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --exit-code 1
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker push "$IMAGE"
+          echo "DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE")" >> "$GITHUB_ENV"
+
+      - uses: sigstore/cosign-installer@v3
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+      - name: Sign image and attest SBOM (keyless)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          cosign sign --yes "$DIGEST"
+          cosign attest --yes --type cyclonedx --predicate sbom.cdx.json "$DIGEST"
+
+      - name: Verify signature (what a deploy step / admission controller would do)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          cosign verify "$DIGEST" \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
