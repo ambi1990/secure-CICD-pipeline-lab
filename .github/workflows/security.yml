@@ -1,4 +1,4 @@
-# Security pipeline for the lab.
+# Security pipeline for the lab. -> this is the workflow
 #
 # Stages:
 #   1. secrets-scan  - Gitleaks over full Git history
@@ -17,16 +17,20 @@
 
 name: security-pipeline
 
+#check every PR before merge to main branch
 on:
   pull_request:
   push:
     branches: [main]
-  workflow_dispatch:
+  workflow_dispatch: #manual run workflow button
 
+#least privilege - only permission to read
 permissions:
   contents: read
 
+#5 jobs that run in parallel
 jobs:
+  #job 1: only checks for exposed secrets
   secrets-scan:
     name: Secrets scan (Gitleaks)
     runs-on: ubuntu-latest
@@ -38,6 +42,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  #job 2: checks for SAST - sql injection, command injection, unsafe YAML, debug mode etc.
   sast:
     name: SAST (Semgrep)
     runs-on: ubuntu-latest
@@ -62,6 +67,8 @@ jobs:
         with:
           sarif_file: semgrep.sarif
 
+  #job 3: scans for outdated third party libraries for existing vulnerabilities: requirements.txt -> sca (software composition analysis)
+  #here sca tool is pip-audit, it can be trivy also (scans requirements.txt and for each package, scans vulnerability databases like NVD, OSV etc.)
   sca:
     name: Dependency scan (pip-audit)
     runs-on: ubuntu-latest
@@ -73,6 +80,7 @@ jobs:
       - run: pip install pip-audit
       - run: pip-audit -r app/requirements.txt --desc
 
+  #job 4: scans the docker file with configs
   config-scan:
     name: Config scan (Checkov)
     runs-on: ubuntu-latest
@@ -84,12 +92,13 @@ jobs:
       - run: pip install checkov
       - run: checkov -d . --framework dockerfile github_actions --compact
 
+  #job 5: scans the image -> supply chain job
   build-scan-sign:
     name: Build, SBOM, image scan, sign
     runs-on: ubuntu-latest
     # Phase 2 exercise: once the earlier findings are fixed, uncomment this so the
     # image is only built when every other gate passes.
-    # needs: [secrets-scan, sast, sca, config-scan]
+    needs: [secrets-scan, sast, sca, config-scan]
     permissions:
       contents: read
       packages: write # push to GHCR

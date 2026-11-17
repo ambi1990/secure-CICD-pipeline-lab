@@ -3,7 +3,7 @@
 #  - runs as root
 #  - no HEALTHCHECK
 #  - secret passed as build arg / env
-FROM python:3.9
+FROM python:3.13-slim
 
 ARG API_KEY=changeme
 ENV API_KEY=${API_KEY}
